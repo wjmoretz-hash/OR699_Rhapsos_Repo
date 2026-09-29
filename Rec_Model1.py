@@ -2,10 +2,10 @@
 """
 Graph-Aware Action Recommender Engine
 =====================================
-Evaluates primary actions (Effect 1) on entities, calculates cascading secondary
-effects (Effect 2) on neighboring entities based on meter-based distances, 
-and scores total strategic impact against top-level battle goals using a 
-directed dependency graph.
+Evaluates primary actions (Effect 1) on entities across ALL time stages,
+calculates cascading secondary effects (Effect 2) on neighboring entities based
+on meter-based distance bounds, and scores total strategic impact based on the 
+fraction of completed nodes reachable in the directed battle_goals_matrix graph.
 """
 
 import sqlite3
@@ -23,7 +23,7 @@ except ImportError:
 DB_PATH = "C:/Users/wjmor/OneDrive/Documents/MS OR/OR699/GMU Project.db"
 
 # Coordinate Transformer: WGS84 Lat/Lon (EPSG:4326) to UTM Zone 18N (EPSG:32618)
-# Used to convert degrees into metric planar Easting & Northing for distance calculations
+# Converts geographical degrees into metric planar Easting & Northing
 GEO_TRANSFORMER = Transformer.from_crs("EPSG:4326", "EPSG:32618", always_xy=True)
 
 # Synonym mapping to align action terminology in effects tables with graph goal nodes
@@ -86,7 +86,7 @@ def normalize_effects_dataframe(df):
     if 'min_distance' not in df.columns:
         df['min_distance'] = 0.0
     if 'max_distance' not in df.columns:
-        df['max_distance'] = 100.0  # Default 100 meters
+        df['max_distance'] = 100.0  # Fallback if unpopulated in database
     if 'secondary_effect' not in df.columns:
         df['secondary_effect'] = 'None'
         
@@ -125,37 +125,38 @@ class GraphAwareActionRecommender:
 
     def evaluate_goal_congruency(self, effect, primary_mission="Defend GMU from Adversary Shapes"):
         """
-        Scores how strongly an effect serves top-level battle goals using 
-        shortest directed path distance within the goal network.
+        Calculates utility as a function of reachable goals in the directed graph.
+        Utility = (Reachable Goal Nodes from Effect) / (Total Goal Nodes in Graph)
         """
         mapped_effect = ACTION_GRAPH_SYNONYMS.get(str(effect).lower(), str(effect).lower())
+        total_nodes = len(self.goal_graph.nodes)
+
+        # Fallback if graph is empty
+        if total_nodes == 0:
+            return 1.0
 
         # Direct match with primary mission statement
         if mapped_effect in primary_mission.lower() or str(effect).lower() in primary_mission.lower():
             return 1.0
-        
-        # Locate corresponding nodes in the goal graph
+
+        # Find matching source nodes in the goal graph
         source_nodes = [
             n for n in self.goal_graph.nodes 
             if mapped_effect in n.lower() or str(effect).lower() in n.lower()
         ]
-        target_nodes = [n for n in self.goal_graph.nodes if primary_mission.lower() in n.lower()]
 
-        if source_nodes and target_nodes:
+        if source_nodes:
             src = source_nodes[0]
-            tgt = target_nodes[0]
+            # Find all nodes reachable from this action node via directed edges
+            reachable_nodes = nx.descendants(self.goal_graph, src)
+            reachable_nodes.add(src)  # Include the node itself
             
-            # Traversing path to top goal gives higher strategic utility
-            if nx.has_path(self.goal_graph, src, tgt):
-                path = nx.shortest_path(self.goal_graph, src, tgt)
-                weight = 1.0
-                for i in range(len(path) - 1):
-                    rel = self.goal_graph.get_edge_data(path[i], path[i+1]).get('relationship', 1)
-                    weight *= 0.85 if rel == 1 else 0.45
-                return weight
+            # Ratio of goal graph completed / contributed to by this action
+            completion_ratio = len(reachable_nodes) / float(total_nodes)
+            return completion_ratio
 
-        # Baseline value for general tactical actions not explicitly linked in graph
-        return 0.3
+        # Default baseline if action isn't explicitly linked in the graph
+        return 0.25
 
     def _calculate_distance_meters(self, lat1, lon1, lat2, lon2):
         """
@@ -180,37 +181,44 @@ class GraphAwareActionRecommender:
             return matches.iloc[0]['secondary_effect']
         return 'None'
 
-    def recommend_best_action(self, state_predictions_df, state_transition, max_eval_radius=100.0, top_k=3):
+    def recommend_best_action(self, state_predictions_df, state_transition):
         """
-        Evaluates candidate actions across target entities, identifies cascading Effect 2 
-        impacts on surrounding entities, and recommends the action yielding the 
-        largest overall positive impact on battle goals.
+        Evaluates ALL candidate actions across target entities and friendly initiating units
+        for the specified state transition, returning the FULL UNFILTERED list of options.
         """
         recommendations = []
         available_actions = self.effects_df['action'].dropna().unique()
-        entities = state_predictions_df.to_dict('records')
+        all_entities = state_predictions_df.to_dict('records')
 
-        for e1 in entities:
+        # Separate candidate targets (enemies) from potential initiating units (allies)
+        enemy_entities = [e for e in all_entities if e.get('allied_probability', 0.5) < 0.5]
+        friendly_entities = [e for e in all_entities if e.get('allied_probability', 0.5) >= 0.5]
+
+        # Fallback if no friendly units are identified
+        if not friendly_entities:
+            friendly_entities = [{'unique_identifier': 'UNASSIGNED_ASSET'}]
+
+        for e1 in enemy_entities:
             e1_id = e1['unique_identifier']
             p_allied_1 = e1.get('allied_probability', 0.5)
-
-            # Skip target selection if entity is perceived as Allied
-            if p_allied_1 >= 0.5:
-                continue
-
             e1_lat, e1_lon = e1['latitude'], e1['longitude']
             reliability_1 = e1.get('latitude_reliability', 1.0)
 
             for action in available_actions:
-                # 1. Evaluate strategic impact of Effect 1 on primary target E1
+                # Retrieve action-specific max cascading distance from effects table
+                action_rows = self.effects_df[self.effects_df['action'].astype(str).str.lower() == str(action).lower()]
+                action_max_dist = action_rows['max_distance'].max() if not action_rows.empty else 100.0
+
+                # 1. Primary target impact (derived from goal graph reachability)
                 e1_goal_utility = self.evaluate_goal_congruency(action)
                 primary_impact = e1_goal_utility * (1.0 - p_allied_1) * reliability_1
                 
                 total_battle_goal_impact = primary_impact
                 cascading_events = []
+                goals_completed_count = int(e1_goal_utility * len(self.goal_graph.nodes))
 
-                # 2. Check all surrounding entities E2 for cascading Effect 2
-                for e2 in entities:
+                # 2. Check all surrounding entities E2 for cascading Effect 2 up to action_max_dist
+                for e2 in all_entities:
                     e2_id = e2['unique_identifier']
                     if e1_id == e2_id:
                         continue
@@ -218,21 +226,19 @@ class GraphAwareActionRecommender:
                     # Compute distance between E1 and E2 in meters
                     dist_meters = self._calculate_distance_meters(e1_lat, e1_lon, e2['latitude'], e2['longitude'])
 
-                    if dist_meters <= max_eval_radius:
-                        # Lookup Effect 2 based on primary action and distance
+                    # Cascading bounds defined strictly by the effect's defined range
+                    if dist_meters <= action_max_dist:
                         effect_2 = self._determine_secondary_effect(action, dist_meters)
                         
                         if effect_2 != 'None':
                             p_allied_2 = e2.get('allied_probability', 0.5)
-                            
-                            # Evaluate strategic impact of Effect 2 on E2 against battle goals
                             e2_goal_utility = self.evaluate_goal_congruency(effect_2)
                             
-                            # Positive value if E2 is enemy; penalty if E2 is friendly
+                            # Positive impact for enemies; penalty for allies
                             net_e2_impact = e2_goal_utility * (1.0 - p_allied_2) - (0.9 * p_allied_2)
                             
-                            # Distance attenuation factor
-                            proximity_weight = 1.0 - (dist_meters / max_eval_radius)
+                            # Proximity attenuation based on max action range
+                            proximity_weight = 1.0 - (dist_meters / action_max_dist) if action_max_dist > 0 else 1.0
                             weighted_e2_impact = net_e2_impact * proximity_weight
                             
                             total_battle_goal_impact += weighted_e2_impact
@@ -245,30 +251,37 @@ class GraphAwareActionRecommender:
                                 'net_cascading_impact': round(weighted_e2_impact, 3)
                             })
 
-                # Scale overall impact to an intuitive score
+                # Scale overall impact score
                 total_efficacy_score = np.clip(total_battle_goal_impact * 100.0, -100.0, 100.0)
 
-                recommendations.append({
-                    'evaluation_state': state_transition,
-                    'target_entity': e1_id,
-                    'recommended_action': action,
-                    'effect_1_goal_score': round(e1_goal_utility, 2),
-                    'predicted_side': 'Enemy',
-                    'target_confidence': round(1.0 - p_allied_1, 3),
-                    'total_battle_goal_impact_score': round(total_efficacy_score, 1),
-                    'cascading_effects_detail': cascading_events
-                })
+                # Assign recommendation across initiating friendly assets
+                for unit in friendly_entities:
+                    initiating_unit_id = unit['unique_identifier']
 
-        # Rank actions by largest positive effect on battle goals
+                    recommendations.append({
+                        'evaluation_state': state_transition,
+                        'initiating_unit': initiating_unit_id,
+                        'target_entity': e1_id,
+                        'recommended_action': action,
+                        'goals_completed_estimate': goals_completed_count,
+                        'effect_1_goal_score': round(e1_goal_utility, 3),
+                        'predicted_side': 'Enemy',
+                        'target_confidence': round(1.0 - p_allied_1, 3),
+                        'total_battle_goal_impact_score': round(total_efficacy_score, 1),
+                        'cascading_effects_detail': cascading_events
+                    })
+
+        # Rank all options by largest positive effect on battle goals
         df_recs = pd.DataFrame(recommendations).sort_values(
             by=['total_battle_goal_impact_score'], 
             ascending=False
         ).reset_index(drop=True)
         
-        return df_recs.head(top_k)
+        # Return complete list without truncation
+        return df_recs
 
 # ---------------------------------------------------------
-# 2. Database Pipeline & Execution Runner
+# 2. Database Pipeline & Execution Runner (All Options Across All Stages)
 # ---------------------------------------------------------
 def generate_recommendations_from_db(db_path=DB_PATH):
     conn = sqlite3.connect(db_path)
@@ -309,22 +322,22 @@ def generate_recommendations_from_db(db_path=DB_PATH):
         
     conn.close()
 
-    # 4. Generate recommendations across evaluation states
-    recommender = GraphAwareActionRecommender(effects_df, df_goals)
+    # 4. Iterate across ALL evaluation states / time stages
     unique_states = sorted(df_predictions['evaluation_state'].unique())
+    print(f"[Execution Engine] Generating full option set across {len(unique_states)} time stages: {unique_states}")
+
+    recommender = GraphAwareActionRecommender(effects_df, df_goals)
     all_recommendations = []
 
     for state in unique_states:
-        if state > 1:
-            state_preds = df_predictions[df_predictions['evaluation_state'] == state]
-            recs = recommender.recommend_best_action(
-                state_preds, 
-                state_transition=state, 
-                max_eval_radius=100.0, 
-                top_k=3
-            )
-            all_recommendations.append(recs)
+        state_preds = df_predictions[df_predictions['evaluation_state'] == state]
+        recs_stage = recommender.recommend_best_action(
+            state_preds, 
+            state_transition=state
+        )
+        all_recommendations.append(recs_stage)
 
+    # Combine full option sets across all stages into a single DataFrame
     master_recs_df = pd.concat(all_recommendations, ignore_index=True) if all_recommendations else pd.DataFrame()
     return master_recs_df
 
@@ -332,18 +345,20 @@ def generate_recommendations_from_db(db_path=DB_PATH):
 if __name__ == "__main__":
     recs_df = generate_recommendations_from_db(DB_PATH)
     
-    print("\n================ RECOMMENDED ACTIONS (LARGEST EFFECT ON BATTLE GOALS) ================")
+    print(f"\n================ FULL RECOMMENDATIONS LIST ({len(recs_df)} TOTAL OPTIONS) ================")
     if not recs_df.empty:
         for state, group in recs_df.groupby('evaluation_state'):
-            print(f"\n--- STATE TRANSITION {state} ---")
-            for _, row in group.iterrows():
-                print(f"\n* Action: [{row['recommended_action'].upper()}] against Entity [{row['target_entity']}]")
-                print(f"  - Primary Effect 1 Goal Utility: {row['effect_1_goal_score']}")
-                print(f"  - Total Strategic Impact Score: {row['total_battle_goal_impact_score']}")
+            print(f"\n--- TIME STAGE / STATE TRANSITION {state} ({len(group)} Options Available) ---")
+            # Show top 5 print preview per stage in console (full data is in recs_df)
+            for _, row in group.head(5).iterrows():
+                print(f"\n* Unit [{row['initiating_unit']}] -> Action: [{row['recommended_action'].upper()}] against Target [{row['target_entity']}]")
+                print(f"   - Graph Goal Completion Fraction: {row['effect_1_goal_score']} (~{row['goals_completed_estimate']} goals reachable)")
+                print(f"   - Target Confidence (Enemy Prob): {row['target_confidence']}")
+                print(f"   - Total Strategic Impact Score: {row['total_battle_goal_impact_score']}")
                 if row['cascading_effects_detail']:
-                    print("  - Cascading Secondary Effects (Effect 2):")
+                    print("   - Cascading Secondary Effects (Effect 2):")
                     for casc in row['cascading_effects_detail']:
-                        print(f"    -> Entity {casc['secondary_entity']} ({casc['distance_m']}m away) "
+                        print(f"     -> Entity {casc['secondary_entity']} ({casc['distance_m']}m away) "
                               f"receives Effect 2 [{casc['effect_2']}] (Net Utility: {casc['net_cascading_impact']})")
                 else:
-                    print("  - Cascading Secondary Effects: None detected within radius")
+                    print("   - Cascading Secondary Effects: None detected within range")
